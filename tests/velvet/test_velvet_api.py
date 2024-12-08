@@ -8,6 +8,7 @@
 """
 
 import os
+import time
 from decimal import Decimal
 
 import pytest
@@ -15,7 +16,7 @@ from eth_typing import HexAddress
 from web3 import Web3
 
 from eth_defi.hotwallet import HotWallet
-from eth_defi.provider.anvil import AnvilLaunch, fork_network_anvil
+from eth_defi.provider.anvil import AnvilLaunch, fork_network_anvil, make_anvil_custom_rpc_request
 from eth_defi.provider.broken_provider import get_almost_latest_block_number
 from eth_defi.provider.multi_provider import create_multi_provider_web3
 from eth_defi.token import TokenDetails, fetch_erc20_details
@@ -42,16 +43,40 @@ def usdc_holder() -> HexAddress:
     return "0x3304E22DDaa22bCdC5fCa2269b418046aE7b566A"
 
 
+@pytest.fixture()
+def existing_shareholder() -> HexAddress:
+    """A user that has shares for the vault that can be redeemed.
+
+    - This user has a pre-approved approve() to withdraw all shares
+
+    https://basescan.org/token/0x205e80371f6d1b33dff7603ca8d3e92bebd7dc25#balances
+    """
+    return "0x0C9dB006F1c7bfaA0716D70F012EC470587a8D4F"
+
 
 @pytest.fixture()
-def anvil_base_fork(request, vault_owner, usdc_holder, deposit_user) -> AnvilLaunch:
+def slippage() -> float:
+    """Slippage value to be used in tests.
+
+    - Deal with mysterious Enso failures
+
+    - Random TooMuchSlippage "2Po" errors
+    """
+    return 0.10
+
+
+
+@pytest.fixture()
+def anvil_base_fork(request, vault_owner, usdc_holder, deposit_user, existing_shareholder) -> AnvilLaunch:
     """Create a testable fork of live BNB chain.
 
     :return: JSON-RPC URL for Web3
     """
+    assert JSON_RPC_BASE is not None, "JSON_RPC_BASE not set"
     launch = fork_network_anvil(
         JSON_RPC_BASE,
-        unlocked_addresses=[vault_owner, usdc_holder, deposit_user],
+        unlocked_addresses=[vault_owner, usdc_holder, deposit_user, existing_shareholder],
+        #  fork_block_number=23261311,  # Cannot use forked state because Enso has its own state
     )
     try:
         yield launch
@@ -62,9 +87,34 @@ def anvil_base_fork(request, vault_owner, usdc_holder, deposit_user) -> AnvilLau
 
 @pytest.fixture()
 def web3(anvil_base_fork) -> Web3:
-    web3 = create_multi_provider_web3(anvil_base_fork.json_rpc_url)
-    assert web3.eth.chain_id == 8453
-    return web3
+    """Create Web3 instance.
+
+    - Use mainnet fork with Anvil for local testing
+
+    - If symbolic transaction debugging is needed, you can override
+      Anvil manually with a Tenderly virtual testnet
+    """
+    # Debug using Tenderly debugger
+    tenderly_fork_rpc = os.environ.get("JSON_RPC_TENDERLY", None)
+
+    if tenderly_fork_rpc:
+        web3 = create_multi_provider_web3(tenderly_fork_rpc)
+        snapshot = make_anvil_custom_rpc_request(web3, "evm_snapshot")
+        try:
+            yield web3
+        finally:
+            # Revert Tenderly testnet back to its original state
+            # https://docs.tenderly.co/forks/guides/testing/reset-transactions-after-completing-the-test
+            make_anvil_custom_rpc_request(web3, "evm_revert", [snapshot])
+    else:
+        # Anvil
+        web3 = create_multi_provider_web3(
+            anvil_base_fork.json_rpc_url,
+            default_http_timeout=(2, 60),
+            retries=0,  # Tests will fail if we need to retry eth_sendTransaction
+        )
+        assert web3.eth.chain_id == 8453
+        yield web3
 
 
 @pytest.fixture()
@@ -73,6 +123,13 @@ def usdc(web3) -> TokenDetails:
         web3,
         "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
     )
+
+
+@pytest.fixture()
+def base_doginme_token(web3) -> TokenDetails:
+    """DogInMe"""
+    return fetch_erc20_details(web3, "0x6921B130D297cc43754afba22e5EAc0FBf8Db75b")
+
 
 
 @pytest.fixture()
@@ -114,7 +171,7 @@ def vault(web3, base_test_vault_spec: VaultSpec) -> VelvetVault:
 
 @pytest.fixture()
 def deposit_user() -> HexAddress:
-    """A user that has preapproved 5 USDC deposit for the vault above, no approve(0 needed."""
+    """A user that has preapproved 5 USDC deposit for the vault above, no approve() needed."""
     return "0x7612A94AafF7a552C373e3124654C1539a4486A8"
 
 
@@ -143,10 +200,11 @@ def test_fetch_vault_portfolio(vault: VelvetVault):
     assert portfolio.spot_erc20["0x6921B130D297cc43754afba22e5EAc0FBf8Db75b"] > 0
 
 
-@pytest.mark.skipif(CI, reason="Enso is such unstable crap that there is no hope we could run any tests with in CI")
+#@pytest.mark.skipif(CI, reason="Enso is such unstable crap that there is no hope we could run any tests with in CI")
 def test_vault_swap_partially(
     vault: VelvetVault,
     vault_owner: HexAddress,
+    slippage: float,
 ):
     """Simulate swap tokens using Enzo.
 
@@ -175,7 +233,7 @@ def test_vault_swap_partially(
         token_in="0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
         token_out="0x6921B130D297cc43754afba22e5EAc0FBf8Db75b",
         swap_amount=1_000_000,  # 1 USDC
-        slippage=0.01,
+        slippage=slippage,
         remaining_tokens=universe.spot_token_addresses,
         swap_all=False,
         from_=vault_owner,
@@ -192,10 +250,11 @@ def test_vault_swap_partially(
     assert portfolio.spot_erc20["0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"] < existing_usdc_balance
 
 
-@pytest.mark.skipif(CI, reason="Enso is such unstable crap that there is no hope we could run any tests with in CI")
+#@pytest.mark.skipif(CI, reason="Enso is such unstable crap that there is no hope we could run any tests with in CI")
 def test_vault_swap_very_little(
     vault: VelvetVault,
     vault_owner: HexAddress,
+    slippage: float,
 ):
     """Simulate swap tokens using Enzo.
 
@@ -213,7 +272,7 @@ def test_vault_swap_very_little(
         token_in="0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
         token_out="0x6921B130D297cc43754afba22e5EAc0FBf8Db75b",
         swap_amount=1,  # 1 USDC
-        slippage=0.01,
+        slippage=slippage,
         remaining_tokens=universe.spot_token_addresses,
         swap_all=False,
         from_=vault_owner,
@@ -224,10 +283,10 @@ def test_vault_swap_very_little(
     assert_transaction_success_with_explanation(web3, tx_hash)
 
 
-@pytest.mark.skipif(CI, reason="Enso is such unstable crap that there is no hope we could run any tests with in CI")
 def test_vault_swap_sell_to_usdc(
     vault: VelvetVault,
     vault_owner: HexAddress,
+    slippage: float,
 ):
     """Simulate swap tokens using Enzo.
 
@@ -250,7 +309,7 @@ def test_vault_swap_sell_to_usdc(
         token_in="0x6921B130D297cc43754afba22e5EAc0FBf8Db75b",
         token_out="0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
         swap_amount=500 * 10**18,
-        slippage=0.01,
+        slippage=slippage,
         remaining_tokens=universe.spot_token_addresses,
         swap_all=False,
         from_=vault_owner,
@@ -264,12 +323,13 @@ def test_vault_swap_sell_to_usdc(
     assert portfolio.spot_erc20["0x833589fcd6edb6e08f4c7c32d4f71b54bda02913"] > existing_usdc_balance
 
 
-@pytest.mark.skipif(CI, reason="Enso is such unstable crap that there is no hope we could run any tests with in CI")
 def test_velvet_api_deposit(
     vault: VelvetVault,
     vault_owner: HexAddress,
     deposit_user: HexAddress,
     usdc: TokenDetails,
+    slippage: float,
+    base_doginme_token: TokenDetails,
 ):
     """Use Velvet API to perform deposit"""
 
@@ -278,7 +338,7 @@ def test_velvet_api_deposit(
     # Velvet vault tracked assets
     universe = TradingUniverse(
         spot_token_addresses={
-            "0x6921B130D297cc43754afba22e5EAc0FBf8Db75b",  # DogInMe
+            base_doginme_token.address,  # DogInMe
             usdc.address,  # USDC on Base
         }
     )
@@ -313,11 +373,94 @@ def test_velvet_api_deposit(
         from_=deposit_user,
         deposit_token_address=usdc.address,
         amount=5 * 10**6,
+        slippage=slippage,
     )
     assert tx_data["to"] == deposit_manager
+    started_at = time.time()
     tx_hash = web3.eth.send_transaction(tx_data)
-    assert_transaction_success_with_explanation(web3, tx_hash)
+    try:
+        assert_transaction_success_with_explanation(web3, tx_hash)
+    except Exception as e:
+        # Double check allowance - Anvil bug
+        duration = time.time() - started_at
+        allowance = usdc.contract.functions.allowance(
+            Web3.to_checksum_address(deposit_user),
+            Web3.to_checksum_address(deposit_manager),
+        ).call()
+        raise RuntimeError(f"transferFrom() failed, allowance after broadcast {allowance / 10**6} USDC: {e}, crash took {duration} seconds") from e
 
     # USDC balance has increased after the deposit
     portfolio = vault.fetch_portfolio(universe, web3.eth.block_number)
     assert portfolio.spot_erc20[usdc.address] > existing_usdc_balance
+
+
+def test_velvet_api_redeem(
+    vault: VelvetVault,
+    vault_owner: HexAddress,
+    existing_shareholder: HexAddress,
+    usdc: TokenDetails,
+    base_doginme_token: TokenDetails,
+    slippage: float,
+):
+    """Use Velvet API to perform redemption.
+
+    - Do autosell redemption
+    """
+
+    web3 = vault.web3
+
+    # Check we have our shares
+    share_token = vault.share_token
+    assert share_token.name == "Example 2"
+    assert share_token.symbol == "EXA2"
+    assert share_token.total_supply == 1000 * 10**18
+    shares = share_token.fetch_balance_of(existing_shareholder)
+    assert shares > 0
+
+    withdrawal_manager = "0x99e9C4d3171aFAA3075D0d1aE2Bb42B5E53aEdAB"
+
+    # Check there is ready-made manual approve() waiting onchain
+    allowance = share_token.contract.functions.allowance(
+        Web3.to_checksum_address(existing_shareholder),
+        Web3.to_checksum_address(withdrawal_manager),
+        ).call()
+    assert allowance == pytest.approx(1000 * 10**18)
+
+    tx_hash = share_token.contract.functions.approve(
+        Web3.to_checksum_address(vault.portfolio_address),
+        share_token.convert_to_raw(shares)
+    ).transact({
+        "from": Web3.to_checksum_address(existing_shareholder),
+    })
+    assert_transaction_success_with_explanation(web3, tx_hash)
+
+    # Velvet vault tracked assets
+    universe = TradingUniverse(
+        spot_token_addresses={
+            base_doginme_token.address,  # DogInMe
+            usdc.address,  # USDC on Base
+        }
+    )
+
+    # Check the existing portfolio USDC balance before starting the
+    # the deposit process
+    latest_block = get_almost_latest_block_number(web3)
+    portfolio = vault.fetch_portfolio(universe, latest_block)
+    existing_usdc_balance = portfolio.spot_erc20[usdc.address]
+    assert existing_usdc_balance > Decimal(1.0)
+
+    # Prepare the redemption tx payload
+    tx_data = vault.prepare_redemption(
+        from_=existing_shareholder,
+        amount=share_token.convert_to_raw(shares),
+        withdraw_token_address=usdc.address,
+        slippage=slippage,
+    )
+    assert tx_data["to"] == withdrawal_manager
+    tx_hash = web3.eth.send_transaction(tx_data)
+    assert_transaction_success_with_explanation(web3, tx_hash)
+
+    # Vault balances are zero after redeeming everything
+    portfolio = vault.fetch_portfolio(universe, web3.eth.block_number)
+    assert portfolio.spot_erc20[usdc.address] == pytest.approx(0)
+    assert portfolio.spot_erc20[base_doginme_token.address] == pytest.approx(0)

@@ -304,7 +304,6 @@ def assert_transaction_success_with_explanation(
     if type(tx_hash) == str:
         tx_hash = HexBytes(tx_hash)
 
-
     receipt = web3.eth.wait_for_transaction_receipt(tx_hash)
     if receipt["status"] == 0:
         # Explain why the transaction failed
@@ -312,18 +311,19 @@ def assert_transaction_success_with_explanation(
 
         on_anvil = is_anvil(web3)
 
+        revert_reason = fetch_transaction_revert_reason(web3, tx_hash)
+
         if on_anvil or tracing:
             # Transaction tracing only enabled to anvil
-            revert_reason = fetch_transaction_revert_reason(web3, tx_hash)
             trace_data = trace_evm_transaction(web3, tx_hash, TraceMethod.parity)
             trace_output = print_symbolic_trace(get_or_create_contract_registry(web3), trace_data)
             raise RaisedException(
-                f"Revert reason: {revert_reason}\nSolidity stack trace:\n{trace_output}\nTransaction details:\n{tx_details}",
+                f"Revert reason: {revert_reason}\nSolidity stack trace:\n{trace_output}\nTransaction details:\n{tx_details}\nTransaction receipt:{receipt}",
                 revert_reason=revert_reason,
                 solidity_stack_trace=trace_output,
             )
         else:
-            raise RaisedException(f"Transaction {tx_hash.hex()} failed: {tx_details} - tracing disabled")
+            raise RaisedException(f"Transaction {tx_hash.hex()} failed: {revert_reason}\nDetails\n{tx_details}\nTracing disabled")
 
     return receipt
 
